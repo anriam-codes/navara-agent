@@ -1,1 +1,1 @@
-# navara-agent
+# NAVARA Agentic RAG for Dev Support
