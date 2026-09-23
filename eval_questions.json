@@ -1,0 +1,26 @@
+[
+  {
+    "question": "My Kafka consumer can't connect. How do I troubleshoot it?",
+    "expected_tool": "search_troubleshooting"
+  },
+  {
+    "question": "What is Kafka's advertised.listeners configuration?",
+    "expected_tool": "search_docs"
+  },
+  {
+    "question": "My PostgreSQL connection is timing out. What should I check?",
+    "expected_tool": "search_troubleshooting"
+  },
+  {
+    "question": "What is Docker used for?",
+    "expected_tool": "search_docs"
+  },
+  {
+    "question": "How do I configure FastAPI environment variables?",
+    "expected_tool": "search_docs"
+  },
+  {
+    "question": "How do I configure Kubernetes Horizontal Pod Autoscaling?",
+    "expected_tool": "none"
+  }
+]
