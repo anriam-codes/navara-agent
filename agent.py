@@ -1,50 +1,38 @@
 import json
+import time
 
-from openai import OpenAI
-from qdrant_client.models import FieldCondition, Filter, MatchText
+from openai import OpenAI, RateLimitError
 
 import config
+from diagnostics import check_service_status
 from retrieve import search
 
-llm = OpenAI(
-    base_url=config.LLM_BASE_URL,
-    api_key=config.LLM_API_KEY
-)
+llm = OpenAI(base_url=config.LLM_BASE_URL, api_key=config.LLM_API_KEY)
 
 SYSTEM = """You are a technical support assistant for Kafka, Docker, PostgreSQL and FastAPI.
-
-Use the available tools to find relevant documentation before answering.
-
+Use the tools to find relevant documentation before answering.
 - search_docs: general concepts and configuration explanations.
-- search_troubleshooting: specific errors, symptoms, causes, and fixes.
+- search_troubleshooting: specific errors, symptoms, and fixes.
+- check_service_status: checks if a local service is actually reachable right now.
+For connectivity questions ("can't connect", "connection refused", "is X running"),
+call check_service_status alongside a troubleshooting search, and combine both in your answer.
+Call each tool at most once per distinct topic. If a tool returns no relevant results,
+do not repeat it with a reworded query — try the other tool once if it might help, otherwise
+tell the user you don't have enough information. Be concise: cause, diagnosis, fix."""
 
-Rules:
-- Call one or both tools when useful.
-- Only answer using information supported by the retrieved documentation.
-- If the tools return no relevant information, clearly say that the knowledge base
-  does not contain enough information.
-- Do not invent commands, configuration values, causes, or fixes.
-- Be concise: cause, diagnosis, fix.
-- When previous conversation context exists, use it to understand follow-up questions.
-"""
+NO_ANSWER = "I couldn't find relevant information in the knowledge base to answer that reliably."
 
 TOOLS = [
     {
         "type": "function",
         "function": {
             "name": "search_docs",
-            "description": (
-                "Search conceptual/reference documentation such as what things are, "
-                "how they work, and configuration settings."
-            ),
+            "description": "Search conceptual/reference documentation (what things are, how they work, config settings).",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "query": {"type": "string"},
-                    "tech": {
-                        "type": "string",
-                        "enum": ["kafka", "docker", "postgresql", "fastapi"]
-                    },
+                    "tech": {"type": "string", "enum": ["kafka", "docker", "postgresql", "fastapi"]},
                 },
                 "required": ["query"],
             },
@@ -54,46 +42,39 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "search_troubleshooting",
-            "description": (
-                "Search troubleshooting documentation for errors, symptoms, "
-                "causes, diagnosis steps, and fixes."
-            ),
+            "description": "Search troubleshooting documentation (errors, symptoms, causes, fixes).",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "query": {"type": "string"},
-                    "tech": {
-                        "type": "string",
-                        "enum": ["kafka", "docker", "postgresql", "fastapi"]
-                    },
+                    "tech": {"type": "string", "enum": ["kafka", "docker", "postgresql", "fastapi"]},
                 },
                 "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "check_service_status",
+            "description": "Check whether a local service (kafka, postgresql, fastapi, docker) is currently reachable on its default port.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "service": {"type": "string", "enum": ["kafka", "postgresql", "fastapi", "docker"]},
+                },
+                "required": ["service"],
             },
         },
     },
 ]
 
 
-def normalize_tech(tech):
-    """Gemini may occasionally return ['kafka'] instead of 'kafka'."""
-    if isinstance(tech, list):
-        return tech[0] if tech else None
-    return tech
-
-
 def _search_by_doc_type(query, tech, doc_suffix):
-    """Search Qdrant and keep only the requested document type."""
-    tech = normalize_tech(tech)
-
-    hits = search(query, config.TOP_K, tech)
-
-    hits = [
-        h for h in hits
-        if h["source"].endswith(doc_suffix)
-        and h["score"] >= config.MIN_SCORE
-    ]
-
-    return hits
+    tech = tech[0] if isinstance(tech, list) else tech  # Gemini sometimes sends tech as a list
+    tech = tech.lower() if tech else None
+    hits = search(query, config.TOP_K, tech, doc_type=doc_suffix)
+    return [h for h in hits if h["score"] >= config.MIN_SCORE]
 
 
 def search_docs(query, tech=None):
@@ -107,151 +88,90 @@ def search_troubleshooting(query, tech=None):
 TOOL_FUNCS = {
     "search_docs": search_docs,
     "search_troubleshooting": search_troubleshooting,
+    "check_service_status": check_service_status,
 }
 
 
-def format_sources(hits):
-    """Create clean source information for the final result."""
-    return [
-        {
-            "source": h["source"],
-            "score": round(h["score"], 3),
-        }
-        for h in hits
-    ]
+def format_sources(sources):
+    seen = []
+    for s in sources:
+        if s not in seen:
+            seen.append(s)
+    return seen
+
+
+def _call_llm(messages):
+    for attempt in range(3):
+        try:
+            return llm.chat.completions.create(
+                model=config.LLM_MODEL, temperature=0, messages=messages, tools=TOOLS
+            )
+        except RateLimitError:
+            raise  # quota exhaustion won't fix itself in seconds — fail fast
+        except Exception:
+            if attempt == 2:
+                raise
+            time.sleep(2 ** attempt)
 
 
 def ask(question, history=None, max_rounds=4):
-    """
-    Ask the agent a question.
-
-    history contains previous messages from the current CLI conversation.
-    """
-    messages = [
-        {"role": "system", "content": SYSTEM}
-    ]
-
-    if history:
-        messages.extend(history)
-
-    messages.append({
-        "role": "user",
-        "content": question
-    })
-
-    tools_used = []
-    sources = []
-    retrieved_anything = False
+    """history: list of prior {"role": ..., "content": ...} turns for follow-up context. Optional."""
+    messages = [{"role": "system", "content": SYSTEM}, *(history or []), {"role": "user", "content": question}]
+    tools_used, sources, retrieved_anything = [], [], False
 
     for _ in range(max_rounds):
-        response = llm.chat.completions.create(
-            model=config.LLM_MODEL,
-            temperature=0,
-            messages=messages,
-            tools=TOOLS,
-        )
-
+        response = _call_llm(messages)
         msg = response.choices[0].message
 
         if not msg.tool_calls:
             answer = msg.content or ""
-
             if not retrieved_anything:
-                answer = (
-                    "I couldn't find relevant information in the knowledge base "
-                    "to answer that reliably."
-                )
-
+                # model answered without retrieving anything grounded — don't let it invent facts
+                answer = NO_ANSWER
             return {
                 "answer": answer,
-                "sources": list(dict.fromkeys(
-                    (s["source"], s["score"]) for s in sources
-                )),
+                "sources": format_sources(sources),
                 "tools_used": tools_used,
-                "history": messages + [
-                    {
-                        "role": "assistant",
-                        "content": answer
-                    }
-                ],
+                "messages": messages + [{"role": "assistant", "content": answer}],
             }
 
         messages.append(msg)
-
         for call in msg.tool_calls:
             args = json.loads(call.function.arguments or "{}")
+            result = TOOL_FUNCS[call.function.name](**args)
+            tools_used.append(call.function.name)
+            print(f"  [{call.function.name}] args={args} → "
+                  f"{result['status'] if call.function.name == 'check_service_status' else f'{len(result)} hits'}")
 
-            tool_name = call.function.name
-            tool_func = TOOL_FUNCS.get(tool_name)
-
-            if not tool_func:
-                result_text = f"Unknown tool: {tool_name}"
-                messages.append({
-                    "role": "tool",
-                    "tool_call_id": call.id,
-                    "content": result_text,
-                })
-                continue
-
-            hits = tool_func(**args)
-
-            print(
-                f"  [{tool_name}] "
-                f"args={args} → {len(hits)} hits"
-            )
-
-            tools_used.append(tool_name)
-
-            if hits:
-                retrieved_anything = True
-
-            sources.extend(format_sources(hits))
-
-            if hits:
-                result_text = "\n\n".join(
-                    f"Source: {h['source']}\n"
-                    f"Relevance: {h['score']:.3f}\n"
-                    f"{h['text']}"
-                    for h in hits
-                )
+            if call.function.name == "check_service_status":
+                result_text = f"{result['service']}: {result['status']} — {result['detail']}"
             else:
-                result_text = (
-                    "No relevant results were found in the knowledge base."
-                )
+                if result:
+                    retrieved_anything = True
+                    sources.extend(f"{h['source']} (score: {h['score']:.2f})" for h in result)
+                result_text = "\n\n".join(h["text"] for h in result) or "No relevant results."
 
-            messages.append({
-                "role": "tool",
-                "tool_call_id": call.id,
-                "content": result_text,
-            })
+            messages.append({"role": "tool", "tool_call_id": call.id, "content": result_text})
 
     return {
         "answer": "I wasn't able to settle on an answer in time.",
-        "sources": [],
+        "sources": format_sources(sources),
         "tools_used": tools_used,
-        "history": messages,
+        "messages": messages,
     }
-
 
 if __name__ == "__main__":
     history = []
-
     while q := input("Question (empty to quit)> ").strip():
-        result = ask(q, history=history)
+        result = ask(q, history)
+        history = result["messages"][1:]  # drop system prompt, keep it for next turn's context
 
-        print("\nAnswer")
-        print("──────")
+        print("\nAnswer\n──────")
         print(result["answer"])
-
         print("\nTools used:", result["tools_used"] or "none")
-
         print("\nSources:")
-        if result["sources"]:
-            for source, score in result["sources"]:
-                print(f"  - {source} (score: {score})")
-        else:
+        for s in result["sources"]:
+            print(f"  - {s}")
+        if not result["sources"]:
             print("  none")
-
         print()
-
-        history = result["history"]
