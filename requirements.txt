@@ -2,3 +2,5 @@ qdrant-client
 fastembed
 python-dotenv
 openai
+fastapi
+uvicorn

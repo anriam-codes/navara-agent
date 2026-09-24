@@ -7,7 +7,7 @@ import config
 from diagnostics import check_service_status
 from retrieve import search
 
-llm = OpenAI(base_url=config.LLM_BASE_URL, api_key=config.LLM_API_KEY)
+llm = OpenAI(base_url=config.LLM_BASE_URL, api_key=config.LLM_API_KEY, timeout=20.0)
 
 SYSTEM = """You are a technical support assistant for Kafka, Docker, PostgreSQL and FastAPI.
 Use the tools to find relevant documentation before answering.
